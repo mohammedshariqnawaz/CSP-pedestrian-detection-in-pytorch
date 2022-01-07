@@ -1,6 +1,7 @@
 import torch
 import math
 import torch.nn as nn
+from torch.nn.modules.activation import Sigmoid
 from resnet import *
 from l2norm import L2Norm
 
@@ -35,13 +36,28 @@ class CSPNet(nn.Module):
         self.p4_l2 = L2Norm(256, 10)
         self.p5_l2 = L2Norm(256, 10)
 
-        self.feat = nn.Conv2d(768, 256, kernel_size=3, stride=1, padding=1, bias=False)
-        self.feat_bn = nn.BatchNorm2d(256, momentum=0.01)
-        self.feat_act = nn.ReLU(inplace=True)
+        # Detection head
+        self.flt = nn.Flatten(2)
+        self.feat_reduced = nn.Sequential(
+            MixerBlock(512*256, 768),
+            nn.Linear(768, 256)
+        )
 
-        self.pos_conv = nn.Conv2d(256, 1, kernel_size=1)
-        self.reg_conv = nn.Conv2d(256, 1, kernel_size=1)
-        self.off_conv = nn.Conv2d(256, 2, kernel_size=1)
+        self.pos_mlp = nn.Sequential(
+            MixerBlock(512*256,256 ),
+            nn.Linear(256,1),
+            nn.Sigmoid()
+        )
+
+        self.reg_mlp = nn.Sequential(
+            MixerBlock(512*256,256 ),
+            nn.Linear(256,1)
+        )
+
+        self.off_mlp = nn.Sequential(
+            MixerBlock(512*256,256 ),
+            nn.Linear(256,2)
+        )
 
         nn.init.xavier_normal_(self.feat.weight)
         nn.init.xavier_normal_(self.pos_conv.weight)
@@ -71,18 +87,18 @@ class CSPNet(nn.Module):
         p5 = self.p5(x)
         p5 = self.p5_l2(p5)
 
-        cat = torch.cat([p3, p4, p5], dim=1)
+        cat = torch.cat([p3, p4, p5], dim=1) #will return array (n,c,h,w)
+        n,c,h,w = cat.shape
+        feat = self.flt(cat) #n,c,h*w
+        feat = feat.transpose(1,2)  #n,h*w,c
 
-        feat = self.feat(cat)
-        feat = self.feat_bn(feat)
-        feat = self.feat_act(feat)
+        feat = self.feat_reduced(feat) #768 to 256
 
-        x_cls = self.pos_conv(feat)
-        x_cls = torch.sigmoid(x_cls)
-        x_reg = self.reg_conv(feat)
-        x_off = self.off_conv(feat)
+        x_cls = self.pos_mlp(feat).transpose(1,2) #n,h*w,1  # We are transposing to match the initial dimensions (n,c,h*w)
+        x_reg = self.reg_mlp(feat).transpose(1,2) #n,h*w,1
+        x_off = self.off_mlp(feat).transpose(1,2) #n,h*w,2
 
-        return x_cls, x_reg, x_off
+        return x_cls.view(n,1,h,w), x_reg.view(n,1,h,w), x_off.view(n,2,h,w)
 
     # def train(self, mode=True):
     #     # Override train so that the training mode is set as we want
@@ -111,7 +127,32 @@ class CSPNet(nn.Module):
 #
 #
 
+class MlpBlock(nn.Module):
+    def __init__(self, hidden_dim, mlp_dim):
+        super(MlpBlock, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, hidden_dim)
+        )
 
+    def forward(self, x):
+        return self.mlp(x)
+        
+class MixerBlock(nn.Module):
+    def __init__(self, num_tokens, num_channels):
+        super(MixerBlock, self).__init__()
+        self.ln_token = nn.LayerNorm(num_channels)
+        self.token_mix = MlpBlock(num_tokens, num_tokens*2)
+        self.ln_channel = nn.LayerNorm(num_channels)
+        self.channel_mix = MlpBlock(num_channels, num_channels*2)
+
+    def forward(self, x):
+        out = self.ln_token(x).transpose(1, 2)
+        x = x + self.token_mix(out).transpose(1, 2)
+        out = self.ln_channel(x)
+        x = x + self.channel_mix(out)
+        return x
 
 class CSPNet_mod(nn.Module):
     # This is Batchnorm fixed version of CSP
