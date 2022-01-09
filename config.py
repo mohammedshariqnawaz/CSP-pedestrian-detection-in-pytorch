@@ -43,4 +43,4 @@ class Config(object):
         self.val_frequency = 10
 
     def print_conf(self):
-        print '\n'.join(['%s:%s' % item for item in self.__dict__.items()])
+        print('\n'.join(['%s:%s' % item for item in self.__dict__.items()]))

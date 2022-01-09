@@ -2,8 +2,8 @@ import torch
 import math
 import torch.nn as nn
 from torch.nn.modules.activation import Sigmoid
-from resnet import *
-from l2norm import L2Norm
+from net.resnet import *
+from .l2norm import L2Norm
 
 
 class CSPNet(nn.Module):
@@ -37,35 +37,26 @@ class CSPNet(nn.Module):
         self.p5_l2 = L2Norm(256, 10)
 
         # Detection head
-        self.flt = nn.Flatten(2)
-        self.feat_reduced = nn.Sequential(
-            MixerBlock(512*256, 768),
+        self.mlp_with_feat_reduced = nn.Sequential(
+            MixerBlock(16, 768),
             nn.Linear(768, 256)
         )
 
         self.pos_mlp = nn.Sequential(
-            MixerBlock(512*256,256 ),
+            MixerBlock(16,256 ),
             nn.Linear(256,1),
             nn.Sigmoid()
         )
 
         self.reg_mlp = nn.Sequential(
-            MixerBlock(512*256,256 ),
+            MixerBlock(16,256 ),
             nn.Linear(256,1)
         )
 
         self.off_mlp = nn.Sequential(
-            MixerBlock(512*256,256 ),
+            MixerBlock(16,256 ),
             nn.Linear(256,2)
         )
-
-        nn.init.xavier_normal_(self.feat.weight)
-        nn.init.xavier_normal_(self.pos_conv.weight)
-        nn.init.xavier_normal_(self.reg_conv.weight)
-        nn.init.xavier_normal_(self.off_conv.weight)
-        nn.init.constant_(self.pos_conv.bias, -math.log(0.99/0.01))
-        nn.init.constant_(self.reg_conv.bias, 0)
-        nn.init.constant_(self.off_conv.bias, 0)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -87,46 +78,57 @@ class CSPNet(nn.Module):
         p5 = self.p5(x)
         p5 = self.p5_l2(p5)
 
-        cat = torch.cat([p3, p4, p5], dim=1) #will return array (n,c,h,w)
-        n,c,h,w = cat.shape
-        feat = self.flt(cat) #n,c,h*w
-        feat = feat.transpose(1,2)  #n,h*w,c
+        cat = torch.cat([p3, p4, p5], dim=1) # (b,c,h,w)
+        
+        cat_permuted = cat.permute(0,2,3,1) #b,h,w,c
+        b,h,w,c =cat_permuted.shape
 
-        feat = self.feat_reduced(feat) #768 to 256
+        windows = window_partition(cat_permuted,4) # num_windows*B, window_size, window_size, C
+        # windows = windows.permute(0,1,3) #h*w* b, p_s*p_s, c
+        
+        feat = self.mlp_with_feat_reduced(windows) #768 to 256
 
-        x_cls = self.pos_mlp(feat).transpose(1,2) #n,h*w,1  # We are transposing to match the initial dimensions (n,c,h*w)
-        x_reg = self.reg_mlp(feat).transpose(1,2) #n,h*w,1
-        x_off = self.off_mlp(feat).transpose(1,2) #n,h*w,2
+        x_cls = self.pos_mlp(feat).transpose(1,2) #b,h*w,1  # We are transposing to match the initial dimensions (n,c,h*w)
+        x_reg = self.reg_mlp(feat).transpose(1,2) #b,h*w,1
+        x_off = self.off_mlp(feat).transpose(1,2) #b,h*w,2
 
-        return x_cls.view(n,1,h,w), x_reg.view(n,1,h,w), x_off.view(n,2,h,w)
+        x_cls = window_reverse(x_cls,4,h,w)
+        x_reg = window_reverse(x_reg,4,h,w)
+        x_off = window_reverse(x_off,4,h,w)
 
-    # def train(self, mode=True):
-    #     # Override train so that the training mode is set as we want
-    #     nn.Module.train(self, mode)
-    #     if mode:
-    #         # Set fixed blocks to be in eval mode
-    #         self.conv1.eval()
-    #         self.layer1.eval()
-    #
-    #         # bn is trainable in CONV2
-    #         def set_bn_train(m):
-    #             class_name = m.__class__.__name__
-    #             if class_name.find('BatchNorm') != -1:
-    #                 m.train()
-    #             else:
-    #                 m.eval()
-    #         self.layer1.apply(set_bn_train)
+        return x_cls.permute(0,2,3,1), x_reg.permute(0,2,3,1), x_off.permute(0,2,3,1)
 
 
-# to do
-#
-# constuct a bn fixed CSP
-#
-#
-#
-#
-#
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size* window_size, C)
+    return windows
 
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    print(windows.shape)
+    print("B",B)
+    x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous().view(B,-1, H, W)
+    return x
+    
 class MlpBlock(nn.Module):
     def __init__(self, hidden_dim, mlp_dim):
         super(MlpBlock, self).__init__()
@@ -138,7 +140,8 @@ class MlpBlock(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
-        
+
+
 class MixerBlock(nn.Module):
     def __init__(self, num_tokens, num_channels):
         super(MixerBlock, self).__init__()
@@ -154,117 +157,3 @@ class MixerBlock(nn.Module):
         x = x + self.channel_mix(out)
         return x
 
-class CSPNet_mod(nn.Module):
-    # This is Batchnorm fixed version of CSP
-    # under construction !!!!!!!!!!!!!!!!!!!
-    def __init__(self):
-        super(CSPNet_mod, self).__init__()
-
-        resnet = resnet50(pretrained=True, receptive_keep=True)
-
-        self.conv1 = resnet.conv1
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
-        self.maxpool = resnet.maxpool
-        self.layer1 = resnet.layer1
-        self.layer2 = resnet.layer2
-        self.layer3 = resnet.layer3
-        self.layer4 = resnet.layer4
-
-        self.p3 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
-        self.p4 = nn.ConvTranspose2d(1024, 256, kernel_size=4, stride=4, padding=0)
-        self.p5 = nn.ConvTranspose2d(2048, 256, kernel_size=4, stride=4, padding=0)
-
-        nn.init.xavier_normal_(self.p3.weight)
-        nn.init.xavier_normal_(self.p4.weight)
-        nn.init.xavier_normal_(self.p5.weight)
-        nn.init.constant_(self.p3.bias, 0)
-        nn.init.constant_(self.p4.bias, 0)
-        nn.init.constant_(self.p5.bias, 0)
-
-        self.p3_l2 = L2Norm(256, 10)
-        self.p4_l2 = L2Norm(256, 10)
-        self.p5_l2 = L2Norm(256, 10)
-
-        self.feat = nn.Conv2d(768, 256, kernel_size=3, stride=1, padding=1, bias=True)
-        self.feat_act = nn.ReLU(inplace=True)
-
-        self.pos_conv = nn.Conv2d(256, 1, kernel_size=1)
-        self.reg_conv = nn.Conv2d(256, 1, kernel_size=1)
-        self.off_conv = nn.Conv2d(256, 2, kernel_size=1)
-
-        nn.init.xavier_normal_(self.feat.weight)
-        nn.init.xavier_normal_(self.pos_conv.weight)
-        nn.init.xavier_normal_(self.reg_conv.weight)
-        nn.init.xavier_normal_(self.off_conv.weight)
-
-        nn.init.constant_(self.feat.bias, 0)
-        nn.init.constant_(self.reg_conv.bias, -math.log(0.99/0.01))
-        nn.init.constant_(self.pos_conv.bias, 0)
-        nn.init.constant_(self.off_conv.bias, 0)
-
-        for p in self.conv1.parameters():
-            p.requires_grad = False
-        for p in self.bn1.parameters():
-            p.requires_grad = False
-        for p in self.layer1.parameters():
-            p.requires_grad = False
-
-        def set_bn_fix(m):
-            classname = m.__class__.__name__
-            if classname.find('BatchNorm') != -1:
-                for p in m.parameters(): p.requires_grad = False
-
-        self.layer2.apply(set_bn_fix)
-        self.layer3.apply(set_bn_fix)
-        self.layer4.apply(set_bn_fix)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-
-        x = self.layer2(x)
-        p3 = self.p3(x)
-        p3 = self.p3_l2(p3)
-
-        x = self.layer3(x)
-        p4 = self.p4(x)
-        p4 = self.p4_l2(p4)
-
-        x = self.layer4(x)
-        p5 = self.p5(x)
-        p5 = self.p5_l2(p5)
-
-        cat = torch.cat([p3, p4, p5], dim=1)
-
-        feat = self.feat(cat)
-        feat = self.feat_act(feat)
-
-        x_cls = self.pos_conv(feat)
-        x_cls = torch.sigmoid(x_cls)
-        x_reg = self.reg_conv(feat)
-        x_off = self.off_conv(feat)
-
-        return x_cls, x_reg, x_off
-
-    def train(self, mode=True):
-        # Override train so that the training mode is set as we want
-        nn.Module.train(self, mode)
-        if mode:
-            # Set fixed blocks to be in eval mode
-            self.conv1.eval()
-            self.bn1.eval()
-            self.layer1.eval()
-
-            def set_bn_eval(m):
-                classname = m.__class__.__name__
-                if classname.find('BatchNorm') != -1:
-                    m.eval()
-
-            self.layer2.apply(set_bn_eval)
-            self.layer3.apply(set_bn_eval)
-            self.layer4.apply(set_bn_eval)

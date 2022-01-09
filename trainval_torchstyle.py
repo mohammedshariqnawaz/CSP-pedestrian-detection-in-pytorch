@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import ToTensor, Normalize, Compose, ColorJitter
 
 from net.loss import *
-from net.network import CSPNet, CSPNet_mod
+from net.network import CSPNet
 from config import Config
 from dataloader.loader import *
 from util.functions import parse_det_offset
